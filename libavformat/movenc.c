@@ -5321,12 +5321,13 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
         !TAG_IS_AVCI(trk->tag) &&
         (par->codec_id != AV_CODEC_ID_DNXHD)) {
         trk->vos_len  = par->extradata_size;
-        trk->vos_data = av_malloc(trk->vos_len);
+        trk->vos_data = av_malloc(trk->vos_len + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!trk->vos_data) {
             ret = AVERROR(ENOMEM);
             goto err;
         }
         memcpy(trk->vos_data, par->extradata, trk->vos_len);
+        memset(trk->vos_data + trk->vos_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     }
 
     if (par->codec_id == AV_CODEC_ID_AAC && pkt->size > 2 &&
@@ -5403,12 +5404,13 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
          par->codec_id == AV_CODEC_ID_AC3) && !trk->vos_len) {
         /* copy frame to create needed atoms */
         trk->vos_len  = size;
-        trk->vos_data = av_malloc(size);
+        trk->vos_data = av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!trk->vos_data) {
             ret = AVERROR(ENOMEM);
             goto err;
         }
         memcpy(trk->vos_data, pkt->data, size);
+        memset(trk->vos_data + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
     }
 
     if (trk->entry >= trk->cluster_capacity) {
@@ -5622,7 +5624,43 @@ static int mov_write_single_packet(AVFormatContext *s, AVPacket *pkt)
             }
         }
 
-        return ff_mov_write_packet(s, pkt);
+        if (pkt->flags & AV_PKT_FLAG_SVT_VP9_EXT_ON) {
+            uint8_t *saved_data = pkt->data;
+            int      saved_size = pkt->size;
+            int64_t  saved_pts  = pkt->pts;
+
+            // Main frame
+            pkt->data = saved_data;
+            pkt->size = saved_size - 4;
+            pkt->pts = saved_pts;
+            ret = ff_mov_write_packet(s, pkt);
+
+            // Latter 4 one-byte repeated frames
+            pkt->data = saved_data + saved_size - 4;
+            pkt->size = 1;
+            pkt->pts = saved_pts - 2;
+            ret = ff_mov_write_packet(s, pkt);
+
+            pkt->data = saved_data + saved_size - 3;
+            pkt->size = 1;
+            pkt->pts = saved_pts - 1;
+            ret = ff_mov_write_packet(s, pkt);
+
+            pkt->data = saved_data + saved_size - 2;
+            pkt->size = 1;
+            pkt->pts = saved_pts;
+            ret = ff_mov_write_packet(s, pkt);
+
+            pkt->data = saved_data + saved_size - 1;
+            pkt->size = 1;
+            pkt->pts = saved_pts + 1;
+            ret = ff_mov_write_packet(s, pkt);
+        }
+        else{
+            ret = ff_mov_write_packet(s, pkt);
+        }
+
+        return ret;
 }
 
 static int mov_write_subtitle_end_packet(AVFormatContext *s,
@@ -6031,12 +6069,13 @@ static int mov_create_dvd_sub_decoder_specific_info(MOVTrack *track,
         cur += strspn(cur, "\n\r");
     }
     if (have_palette) {
-        track->vos_data = av_malloc(16*4);
+        track->vos_data = av_malloc(16*4 + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!track->vos_data)
             return AVERROR(ENOMEM);
         for (i = 0; i < 16; i++) {
             AV_WB32(track->vos_data + i * 4, palette[i]);
         }
+        memset(track->vos_data + 16*4, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         track->vos_len = 16 * 4;
     }
     st->codecpar->width = width;
@@ -6393,11 +6432,12 @@ static int mov_write_header(AVFormatContext *s)
                 mov_create_dvd_sub_decoder_specific_info(track, st);
             else if (!TAG_IS_AVCI(track->tag) && st->codecpar->codec_id != AV_CODEC_ID_DNXHD) {
                 track->vos_len  = st->codecpar->extradata_size;
-                track->vos_data = av_malloc(track->vos_len);
+                track->vos_data = av_malloc(track->vos_len + AV_INPUT_BUFFER_PADDING_SIZE);
                 if (!track->vos_data) {
                     return AVERROR(ENOMEM);
                 }
                 memcpy(track->vos_data, st->codecpar->extradata, track->vos_len);
+                memset(track->vos_data + track->vos_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
             }
         }
 
@@ -6653,10 +6693,11 @@ static int mov_write_trailer(AVFormatContext *s)
             AVCodecParameters *par = track->par;
 
             track->vos_len  = par->extradata_size;
-            track->vos_data = av_malloc(track->vos_len);
+            track->vos_data = av_malloc(track->vos_len + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!track->vos_data)
                 return AVERROR(ENOMEM);
             memcpy(track->vos_data, par->extradata, track->vos_len);
+            memset(track->vos_data + track->vos_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         }
         mov->need_rewrite_extradata = 0;
     }
@@ -6757,6 +6798,10 @@ static int mov_check_bitstream(struct AVFormatContext *s, const AVPacket *pkt)
 {
     int ret = 1;
     AVStream *st = s->streams[pkt->stream_index];
+
+    if ((pkt->flags & AV_PKT_FLAG_SVT_VP9_EXT_ON) ||
+        (pkt->flags & AV_PKT_FLAG_SVT_VP9_EXT_OFF))
+        return 0;
 
     if (st->codecpar->codec_id == AV_CODEC_ID_AAC) {
         if (pkt->size > 2 && (AV_RB16(pkt->data) & 0xfff0) == 0xfff0)

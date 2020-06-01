@@ -31,6 +31,9 @@
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "internal.h"
+#include "libavutil/xga_font_data.h"
+#include "libavutil/time.h"
+#include "libavutil/time_internal.h"
 
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, dl_fn->cuda_dl, x)
 
@@ -95,6 +98,57 @@ static const struct {
     { NV_ENC_ERR_RESOURCE_NOT_MAPPED,      AVERROR(EBADF),   "resource not mapped"      },
 };
 
+static void format_date_now(char *buf, int size)
+{
+    struct tm *ptm, tmbuf;
+    int64_t time_us = av_gettime();
+    int64_t time_ms = time_us / 1000;
+    const time_t time_s = time_ms / 1000;
+    int millisec = time_ms - (time_s * 1000);
+    ptm = gmtime_r(&time_s, &tmbuf);
+    if (ptm) {
+        int len;
+        if (!strftime(buf, size, "%Y-%m-%dT%H:%M:%S", ptm)) {
+            buf[0] = '\0';
+            return;
+        }
+        len = strlen(buf);
+        snprintf(buf + len, size - len, ".%03dZ", millisec);
+    }
+}
+
+static void drawTimeString(AVFrame *pic)
+{
+    const uint8_t *font;
+    int font_height;
+    int i;
+
+    font = avpriv_cga_font,   font_height =  8;
+    char time_text[32];
+    format_date_now(time_text, 32);
+    //av_log(NULL, AV_LOG_INFO, "%s\n", time_text);
+    int offset_pos = 11; //"2020-02-05T"
+    int hh_mm_ss_milli_len = 12;
+    int x = 0;
+    int y = 0;
+    for (i = 0; i < hh_mm_ss_milli_len; i++) {
+        int char_y, mask;
+
+        uint8_t *p = pic->data[0] + y*pic->linesize[0] + (x + i*8);
+        for (char_y = 0; char_y < font_height; char_y++) {
+            for (mask = 0x80; mask; mask >>= 1) {
+                if (font[time_text[offset_pos+i] * font_height + char_y] & mask) {
+                    p[0] = 0xFF;
+                    //p[1] = 0xFF;
+                    //p[2] = 0xFF;
+                }
+                p += 1;
+            }
+            p += pic->linesize[0] - 8;
+        }
+    }
+}
+
 static int nvenc_map_error(NVENCSTATUS err, const char **desc)
 {
     int i;
@@ -122,7 +176,15 @@ static int nvenc_print_error(void *log_ctx, NVENCSTATUS err,
 
 static void nvenc_print_driver_requirement(AVCodecContext *avctx, int level)
 {
-#if NVENCAPI_CHECK_VERSION(9, 0)
+#if NVENCAPI_CHECK_VERSION(9, 2)
+    const char *minver = "(unknown)";
+#elif NVENCAPI_CHECK_VERSION(9, 1)
+# if defined(_WIN32) || defined(__CYGWIN__)
+    const char *minver = "436.15";
+# else
+    const char *minver = "435.21";
+# endif
+#elif NVENCAPI_CHECK_VERSION(9, 0)
 # if defined(_WIN32) || defined(__CYGWIN__)
     const char *minver = "418.81";
 # else
@@ -1828,7 +1890,11 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
         goto error;
     }
 
-    if (res = ff_alloc_packet2(avctx, pkt, lock_params.bitstreamSizeInBytes,0)) {
+    res = pkt->data ?
+        ff_alloc_packet2(avctx, pkt, lock_params.bitstreamSizeInBytes, lock_params.bitstreamSizeInBytes) :
+        av_new_packet(pkt, lock_params.bitstreamSizeInBytes);
+
+    if (res < 0) {
         p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmpoutsurf->output_surface);
         goto error;
     }
@@ -2048,6 +2114,8 @@ int ff_nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     }
 
     if (frame) {
+        drawTimeString(frame);
+
         in_surf = get_free_frame(ctx);
         if (!in_surf)
             return AVERROR(EAGAIN);
